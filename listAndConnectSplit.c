@@ -47,10 +47,6 @@
 #define DWORD uint32_t
 #endif
 
-#ifndef SCARD_PROTOCOL_Tx
-#define SCARD_PROTOCOL_Tx SCARD_PROTOCOL_T0
-#endif
-
 #ifndef SCARD_CTL_CODE
 #define SCARD_CTL_CODE(code) (0x42000000 + (code)) // https://web.archive.org/web/20171027125417/https://pcsclite.alioth.debian.org/api/reader_8h.html
 #endif
@@ -61,7 +57,7 @@
 LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders);
 LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol);
 LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
-LONG disableBuzzer(SCARDHANDLE hCard);
+LONG disableBuzzer(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
 void disconnectReader(SCARDHANDLE hCard, SCARDCONTEXT hContext);
 
 // interact with tags
@@ -69,45 +65,62 @@ LONG readUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
 
 // helper functions
 BOOL containsSubstring(const char *string, const char *substring);
+void printHex(LPCBYTE pbData, DWORD cbData);
 
 // --------------------------------------- Functions --------------------------------------
 
 LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders) {
     LONG lRet = SCardListReaders(hContext, NULL, mszReaders, dwReaders);
     if (lRet != SCARD_S_SUCCESS) {
-        printf("Failed to list readers: 0x%X\n", (unsigned int)lRet);
+        if (lRet == 0x8010002E) {
+            printf("Failed to list readers: Are you sure your smart card reader is connected and turned on?\n");
+        } else {
+            printf("Failed to list readers: 0x%X\n", (unsigned int)lRet);
+        }
     }
+
     return lRet;
 }
 
 LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol) {
-    LONG lRet = SCardConnect(hContext, reader, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T0 | SCARD_PROTOCOL_T1, hCard, dwActiveProtocol);
+    // T1 = block transmission (works), T0 = character transmission (did not work when testing), Tx = T0 | T1 (works)
+    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/41673567-2710-4e86-be87-7b6f46fe10af
+    LONG lRet = SCardConnect(hContext, reader, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T1, hCard, dwActiveProtocol);
 
     return lRet;
 }
 
 LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {  
     LONG lRet = SCardTransmit(hCard, SCARD_PCI_T1, pbSendBuffer, dwSendLength, NULL, pbRecvBuffer, dwRecvLength);
+    // also print reply
+    if (lRet == SCARD_S_SUCCESS) {
+        // print which command you sent
+        printf("> ");
+        printHex(pbSendBuffer, dwSendLength);
+
+        // print what you received
+        printf("< ");
+        printHex(pbRecvBuffer, *dwRecvLength);
+
+    } else {
+        printf("%08x\n", lRet);
+    }   
+
     return lRet;
 }
 
-LONG disableBuzzer(SCARDHANDLE hCard) {
+LONG disableBuzzer(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
     // Ensure the card is connected and active
     if (hCard == 0) {
         printf("Reader not connected anymore!\n");
         return SCARD_E_NOT_TRANSACTED;
     }
 
-    // Define ACR122U command to disable the buzzer sound (really annoying sound)
+    // Define ACR122U command to disable the buzzer sound (really annoying sound) [section: 'Set buzzer output during card detection']
     BYTE pbSendBuffer[] = { 0xFF, 0x00, 0x52, 0x00, 0x00 };
-    DWORD cbRecvLength = 7;
+    DWORD cbRecvLength = 16;
 
-    #ifdef _WIN32
-    LONG result = SCardControl(hCard, SCARD_CTL_CODE(3500), pbSendBuffer, sizeof(pbSendBuffer), NULL, 0, &cbRecvLength); //  3500 escape code defined by microsoft
-    #elif __APPLE__
-    LONG result = SCardControl(hCard, SCARD_CTL_CODE(2079), pbSendBuffer, sizeof(pbSendBuffer), NULL, 0, &cbRecvLength); //  2079 escape code defined by ACS
-    // Problem: macOS either pretends it did work but it didn't actually disable the buzzer OR it throws SCARD_E_NOT_TRANSACTED (tried both 2079 and 3500)
-    #endif
+    LONG result = SCardControl(hCard, SCARD_CTL_CODE(3500), pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, *dwRecvLength, &cbRecvLength); //  3500 escape code defined by microsoft, 2079 escape code defined by ACS, i tried both and only 3500 works on every OS
 
     return result;
 }
@@ -155,6 +168,16 @@ BOOL containsSubstring(const char *string, const char *substring) {
     // Return 0 (false) if the substring was not found
     return FALSE;
 }
+
+// printHex prints bytes as hex
+void printHex(LPCBYTE pbData, DWORD cbData) {
+    for (DWORD i = 0; i < cbData; i++) {
+        printf("%02x ", pbData[i]);
+    }
+    printf("\n");
+}
+
+// -------------------------------------------------------
 
 int main(void) {
     SCARDCONTEXT hContext;
@@ -225,10 +248,9 @@ int main(void) {
         lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol);
     }
     printf("Connected to reader: %s\nDetected NFC tag\n", reader);
-
-    // Turn off buzzer of ACR122U (i could not get this to work on macOS, i always get: SCARD_E_NOT_TRANSACTED)
-    //#ifdef _WIN32
-    lRet = disableBuzzer(hCard);
+ 
+    // Turn off buzzer of ACR122U
+    lRet = disableBuzzer(hCard, pbRecvBuffer, &dwRecvLength);
     if (lRet == 0) {
         printf("Disabled buzzer of reader\n");
     } else {
@@ -239,8 +261,7 @@ int main(void) {
         }
         
     }
-    //#endif
-    
+
     // -------------- Interact with tag ---------------------------
 
     // Get UID of detected tag
