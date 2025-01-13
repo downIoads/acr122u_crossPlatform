@@ -1,15 +1,15 @@
 // Tested on macOS Sequoia, windows 10, windows 11
 
 // windows instructions:
-	// 0. install the windows sdk (e.g. via visual studio or via download)
-	// 1. install latest llvm to get clang (https://github.com/llvm/llvm-project/releases/latest)
-	// 2. Compile with (you might need to replace paths): clang.exe listAndConnectSplit.c -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um" -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared" -L"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um\x64" -lwinscard -o listAndConnectSplit.exe
+    // 0. install the windows sdk (e.g. via visual studio or via download)
+    // 1. install latest llvm to get clang (https://github.com/llvm/llvm-project/releases/latest)
+    // 2. Compile with (you might need to replace paths): clang.exe listAndConnectSplit.c -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um" -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared" -L"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um\x64" -lwinscard -o listAndConnectSplit.exe
 
 // macOS instructions:
-	// 0. There is no need to install the official drivers for 122U (neither for windows nor for macOS)
-	// 1. Ensure pcscd is running: sudo launchctl enable system/com.apple.pcscd , then reboot
-	// 2. Compile with: clang listAndConnectSplit.c -framework PCSC -o listAndConnectSplit
-	// 3. Run with: ./listAndConnect
+    // 0. There is no need to install the official drivers for 122U (neither for windows nor for macOS)
+    // 1. Ensure pcscd is running: sudo launchctl enable system/com.apple.pcscd , then reboot
+    // 2. Compile with: clang listAndConnectSplit.c -framework PCSC -o listAndConnectSplit
+    // 3. Run with: ./listAndConnect
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,9 +55,9 @@
 
 // general functions
 LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders);
-LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol);
+LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BOOL directConnect);
 LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
-LONG disableBuzzer(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
+LONG disableBuzzer(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
 void disconnectReader(SCARDHANDLE hCard, SCARDCONTEXT hContext);
 
 // interact with tags
@@ -82,10 +82,17 @@ LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReade
     return lRet;
 }
 
-LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol) {
-    // T1 = block transmission (works), T0 = character transmission (did not work when testing), Tx = T0 | T1 (works)
-    // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/41673567-2710-4e86-be87-7b6f46fe10af
-    LONG lRet = SCardConnect(hContext, reader, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T1, hCard, dwActiveProtocol);
+LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BOOL directConnect) {
+    LONG lRet;
+
+    if (directConnect) {
+        // direct communication with reader (no present tag required)
+        lRet = SCardConnect(hContext, reader, SCARD_SHARE_DIRECT, SCARD_PROTOCOL_T1, hCard, dwActiveProtocol);
+    } else {
+        // T1 = block transmission (works), T0 = character transmission (did not work when testing), Tx = T0 | T1 (works)
+        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpesc/41673567-2710-4e86-be87-7b6f46fe10af
+        lRet = SCardConnect(hContext, reader, SCARD_SHARE_SHARED, SCARD_PROTOCOL_T1, hCard, dwActiveProtocol);
+    }
 
     return lRet;
 }
@@ -109,18 +116,19 @@ LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE
     return lRet;
 }
 
-LONG disableBuzzer(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
-    // Ensure the card is connected and active
-    if (hCard == 0) {
-        printf("Reader not connected anymore!\n");
-        return SCARD_E_NOT_TRANSACTED;
+LONG disableBuzzer(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
+    LONG lRet = connectToReader(hContext, reader, hCard, dwActiveProtocol, TRUE);
+    if (lRet != SCARD_S_SUCCESS) {
+        printf("Failed to connect: 0x%x\n", (unsigned int)lRet);
+        return 1;
     }
+
 
     // Define ACR122U command to disable the buzzer sound (really annoying sound) [section: 'Set buzzer output during card detection']
     BYTE pbSendBuffer[] = { 0xFF, 0x00, 0x52, 0x00, 0x00 };
     DWORD cbRecvLength = 16;
 
-    LONG result = SCardControl(hCard, SCARD_CTL_CODE(3500), pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, *dwRecvLength, &cbRecvLength); //  3500 escape code defined by microsoft, 2079 escape code defined by ACS, i tried both and only 3500 works on every OS
+    LONG result = SCardControl(*hCard, SCARD_CTL_CODE(3500), pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, *dwRecvLength, &cbRecvLength); //  3500 escape code defined by microsoft, 2079 escape code defined by ACS, i tried both and only 3500 works on every OS
 
     return result;
 }
@@ -222,8 +230,22 @@ int main(void) {
         return 1;
     }
 
+    // Turn off buzzer of ACR122U
+    lRet = disableBuzzer(hContext, reader, &hCard, &dwActiveProtocol, pbRecvBuffer, &dwRecvLength);
+    if (lRet == 0) {
+        printf("Disabled buzzer of reader\n");
+        SCardDisconnect(hCard, SCARD_LEAVE_CARD);
+    } else {
+        if (lRet == 0x80100016) {
+            printf("Failed to disable buzzer of ACR122U: SCARD_E_NOT_TRANSACTED - An attempt was made to end a nonexistent transaction.\n");
+        } else {
+            printf("Failed to disable buzzer of ACR122U: 0x%x\n", (unsigned int)lRet);
+        }
+        
+    }
+
     // Connect to the first reader
-    lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol);
+    lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol, FALSE);
     BOOL didPrintWarningAlready = FALSE;
     while (lRet != SCARD_S_SUCCESS) {
         if ((lRet == SCARD_E_NO_SMARTCARD) || (lRet == SCARD_W_REMOVED_CARD)) {
@@ -245,22 +267,9 @@ int main(void) {
         
         // wait a bit and retry (maybe user is not holding a tag near the reader yet)
         SLEEP(50); // milliseconds (don't put this value too low, it never worked for me with 1 ms)
-        lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol);
+        lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol, FALSE);
     }
     printf("Connected to reader: %s\nDetected NFC tag\n", reader);
- 
-    // Turn off buzzer of ACR122U
-    lRet = disableBuzzer(hCard, pbRecvBuffer, &dwRecvLength);
-    if (lRet == 0) {
-        printf("Disabled buzzer of reader\n");
-    } else {
-        if (lRet == 0x80100016) {
-            printf("Failed to disable buzzer of ACR122U: SCARD_E_NOT_TRANSACTED - An attempt was made to end a nonexistent transaction.\n");
-        } else {
-            printf("Failed to disable buzzer of ACR122U: 0x%x\n", (unsigned int)lRet);
-        }
-        
-    }
 
     // -------------- Interact with tag ---------------------------
 
