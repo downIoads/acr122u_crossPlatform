@@ -3,76 +3,22 @@
 // windows instructions:
     // 0. install the windows sdk (e.g. via visual studio or via download)
     // 1. install latest llvm to get clang (https://github.com/llvm/llvm-project/releases/latest)
-    // 2. Compile with (you might need to replace paths): clang.exe listAndConnectSplit.c -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um" -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared" -L"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um\x64" -lwinscard -o listAndConnectSplit.exe
-
+    // 2. Compile with (you might need to replace paths): clang.exe *.c -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um" -I"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\shared" -L"C:\Program Files (x86)\Windows Kits\10\Include\10.0.22621.0\um\x64" -lwinscard -o main.exe
+    // 3. Run with: main
 // macOS instructions:
     // 0. There is no need to install the official drivers for 122U (neither for windows nor for macOS)
     // 1. Ensure pcscd is running: sudo launchctl enable system/com.apple.pcscd , then reboot
-    // 2. Compile with: clang listAndConnectSplit.c -framework PCSC -o listAndConnectSplit
-    // 3. Run with: ./listAndConnect
+    // 2. Compile with: make
+    // 3. Run with: ./main
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "main.h"
+#include "mifare-classic.h"
 
-// _WIN64 also is defined as _WIN32
-#ifdef _WIN32
-#include <stdint.h>
-#include <windows.h> // contains Sleep
-#include <winscard.h>
-#include <wtypes.h>
-#define SLEEP(milliseconds) Sleep(milliseconds)
-
-#elif __APPLE__
-#include <PCSC/winscard.h>
-#include <PCSC/wintypes.h>
-
-// Nice cross-platform Sleep doesn't exist, instead call usleep and convert microsecond result into milliseconds to match window's Sleep()
-#include <unistd.h> // contains usleep
-#define SLEEP(ms) usleep((ms) * 1000)
-
-#ifndef FALSE
-#define FALSE 0
-#endif
-
-#ifndef TRUE
-#define TRUE 1
-#endif
-
-#ifndef LONG
-#define LONG int32_t
-#endif
-
-#ifndef DWORD
-#define DWORD uint32_t
-#endif
-
-#ifndef SCARD_CTL_CODE
-#define SCARD_CTL_CODE(code) (0x42000000 + (code)) // https://web.archive.org/web/20171027125417/https://pcsclite.alioth.debian.org/api/reader_8h.html
-#endif
-
-#endif
-
-// general functions
-LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders);
-LONG connectToReader(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BOOL directConnect);
-LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
-LONG disableBuzzer(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
-void disconnectReader(SCARDHANDLE hCard, SCARDCONTEXT hContext);
-
-// interact with tags
-LONG readUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
-
-// helper functions
-BOOL containsSubstring(const char *string, const char *substring);
-void printHex(LPCBYTE pbData, DWORD cbData);
-
-// --------------------------------------- Functions --------------------------------------
 
 LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders) {
     LONG lRet = SCardListReaders(hContext, NULL, mszReaders, dwReaders);
     if (lRet != SCARD_S_SUCCESS) {
-        if (lRet == 0x8010002E) {
+        if (lRet == (int32_t)0x8010002E) {
             printf("Failed to list readers: Are you sure your smart card reader is connected and turned on?\n");
         } else {
             printf("Failed to list readers: 0x%X\n", (unsigned int)lRet);
@@ -110,7 +56,7 @@ LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE
         printHex(pbRecvBuffer, *dwRecvLength);
 
     } else {
-        printf("%08x\n", lRet);
+        printf("%08lx\n", lRet);
     }   
 
     return lRet;
@@ -138,12 +84,39 @@ void disconnectReader(SCARDHANDLE hCard, SCARDCONTEXT hContext) {
     SCardReleaseContext(hContext);
 }
 
-// -------------------- Functions that interact with NFC tags ----------------------------------
+// -------------------- General Functions that interact with various tags ----------------------------------
 
-LONG readUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
+LONG getUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL printResult) {
     // Define the GET UID APDU command (PC/SC standard for many cards)
     BYTE pbSendBuffer[] = { 0xFF, 0xCA, 0x00, 0x00, 0x00 };
-    return executeApdu(hCard, pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, dwRecvLength);
+    LONG lRet = executeApdu(hCard, pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, dwRecvLength);
+
+    // ensure 90 00 success is returned by acr122u
+    if (!((pbRecvBuffer[4] == 0x90) && (pbRecvBuffer[5] == 0x00))) {
+        lRet = ACR_90_00_FAILURE;
+    }
+
+    if ((lRet == SCARD_S_SUCCESS) && printResult) {
+        // success: now print UID
+        printf("UID of detected NFC tag: ");
+        for (DWORD i = 0; i < *dwRecvLength - 2; i++) { // -2 because no need to print success code 90 00
+            printf("%02X ", pbRecvBuffer[i]);
+        }
+        printf("\n");
+    }
+
+    return lRet;
+}
+
+LONG getATR(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
+    BYTE pbSendBuffer[] = { 0xFF, 0xCA, 0x01, 0x00, 0x00 };
+    LONG lRet = executeApdu(hCard, pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, dwRecvLength);
+
+    if ((pbRecvBuffer[0] == 0x6A) && (pbRecvBuffer[1] == 0x81)) {
+        printf("Accessing ATR of this tag is not supported!\n");
+    }
+
+    return lRet;
 }
 
 // -------------------- Helper functions -------------------------------------------------------
@@ -189,7 +162,7 @@ void printHex(LPCBYTE pbData, DWORD cbData) {
 
 int main(void) {
     SCARDCONTEXT hContext;
-    SCARDHANDLE hCard;
+    SCARDHANDLE hCard = 0;
     DWORD dwActiveProtocol;
     char mszReaders[1024];
     DWORD dwReaders = sizeof(mszReaders);
@@ -236,7 +209,7 @@ int main(void) {
         printf("Disabled buzzer of reader\n");
         SCardDisconnect(hCard, SCARD_LEAVE_CARD);
     } else {
-        if (lRet == 0x80100016) {
+        if (lRet == (int32_t)0x80100016) {
             printf("Failed to disable buzzer of ACR122U: SCARD_E_NOT_TRANSACTED - An attempt was made to end a nonexistent transaction.\n");
         } else {
             printf("Failed to disable buzzer of ACR122U: 0x%x\n", (unsigned int)lRet);
@@ -248,12 +221,12 @@ int main(void) {
     lRet = connectToReader(hContext, reader, &hCard, &dwActiveProtocol, FALSE);
     BOOL didPrintWarningAlready = FALSE;
     while (lRet != SCARD_S_SUCCESS) {
-        if ((lRet == SCARD_E_NO_SMARTCARD) || (lRet == SCARD_W_REMOVED_CARD)) {
+        if ((lRet == (int32_t)SCARD_E_NO_SMARTCARD) || (lRet == (int32_t)SCARD_W_REMOVED_CARD)) {
             if (!didPrintWarningAlready) {
                 printf("Failed to connect: Please now hold an NFC tag near the reader...\n");
                 didPrintWarningAlready = TRUE;
             }
-        } else if (lRet == SCARD_E_TIMEOUT) {
+        } else if (lRet == (int32_t)SCARD_E_TIMEOUT) {
             if (!didPrintWarningAlready) {
                 printf("Failed to connect: Please now hold an NFC tag near the reader...\n");
                 didPrintWarningAlready = TRUE;
@@ -274,18 +247,28 @@ int main(void) {
     // -------------- Interact with tag ---------------------------
 
     // Get UID of detected tag
-    lRet = readUID(hCard, pbRecvBuffer, &dwRecvLength);
+    lRet = getUID(hCard, pbRecvBuffer, &dwRecvLength, TRUE);
     if (lRet != SCARD_S_SUCCESS) {
-        printf("Failed to get UID of tag: 0x%x\n", (unsigned int)lRet);
+        if (!(lRet == ACR_90_00_FAILURE)) {
+            printf("Failed to get UID of tag: 0x%x\n", (unsigned int)lRet);
+        } else {
+            printf("Failed to get UID of tag: ACR122U did not return the expected 90 00 return code!\n");
+        }
+        
         disconnectReader(hCard, hContext);
         return 1;
     }
 
-    printf("UID of detected NFC tag: ");
-    for (DWORD i = 0; i < dwRecvLength - 2; i++) { // -2 because no need to print success code 90 00
-        printf("%02X ", pbRecvBuffer[i]);
+
+    // Get ATR 14443-3
+    lRet = getATR(hCard, pbRecvBuffer, &dwRecvLength);
+    if (lRet != SCARD_S_SUCCESS) {
+        printf("Failed to get ATR of tag: 0x%x\n", (unsigned int)lRet);
+        disconnectReader(hCard, hContext);
+        return 1;
     }
-    printf("\n");
+
+    // TODO: improve function getATR(), ideally so that you can identify exact name of tag for a large number of tags
     
     // -------------- End of: Interact with tag --------------------
 
