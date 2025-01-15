@@ -17,6 +17,9 @@
 #include <wtypes.h>
 #define SLEEP(milliseconds) Sleep(milliseconds)
 
+#define LONG int32_t // for some reason on windows clang wants me to use "08lx" and on macOS "08x"
+
+
 #elif __APPLE__
 #include <PCSC/winscard.h>
 #include <PCSC/wintypes.h>

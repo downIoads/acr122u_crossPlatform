@@ -24,5 +24,6 @@ const BYTE ACCESS_BITS_NDEF_SECTOR115[] = { 0x7F, 0x07, 0x88, 0x40 };
 
 
 BOOL mifare_classic_get_sector_bytes(LONG sector) {
+	if (sector == 0x123) {};
 	return TRUE;
 }

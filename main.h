@@ -12,8 +12,10 @@ LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE
 LONG disableBuzzer(SCARDCONTEXT hContext, const char *reader, SCARDHANDLE *hCard, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
 void disconnectReader(SCARDHANDLE hCard, SCARDCONTEXT hContext);
 
-// interact with tags
+// general interactions with tags
 LONG getUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL printResult);
+LONG getATS_14443A(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength);
+LONG getStatus(SCARDHANDLE *hCard, char *mszReaders, DWORD dwState, DWORD dwReaders, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL printResult);
 
 // helper functions
 BOOL containsSubstring(const char *string, const char *substring);

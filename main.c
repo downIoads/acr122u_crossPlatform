@@ -12,7 +12,7 @@
     // 3. Run with: ./main
 
 #include "main.h"
-#include "mifare-classic.h"
+//#include "mifare-classic.h"
 
 
 LONG getAvailableReaders(SCARDCONTEXT hContext, char *mszReaders, DWORD *dwReaders) {
@@ -56,7 +56,7 @@ LONG executeApdu(SCARDHANDLE hCard, BYTE *pbSendBuffer, DWORD dwSendLength, BYTE
         printHex(pbRecvBuffer, *dwRecvLength);
 
     } else {
-        printf("%08lx\n", lRet);
+        printf("%08x\n", lRet);
     }   
 
     return lRet;
@@ -91,10 +91,14 @@ LONG getUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL pri
     BYTE pbSendBuffer[] = { 0xFF, 0xCA, 0x00, 0x00, 0x00 };
     LONG lRet = executeApdu(hCard, pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, dwRecvLength);
 
-    // ensure 90 00 success is returned by acr122u
-    if (!((pbRecvBuffer[4] == 0x90) && (pbRecvBuffer[5] == 0x00))) {
+    // ensure 90 00 success is returned by acr122u ()
+    if (!((pbRecvBuffer[4] == 0x90 && pbRecvBuffer[5] == 0x00) ||   // UID of length 4: single UID
+         (pbRecvBuffer[7] == 0x90 && pbRecvBuffer[8] == 0x00)  ||   // UID of length 7: double UID
+         (pbRecvBuffer[10] == 0x90 && pbRecvBuffer[11] == 0x00)     // UID of length 10: oh baby a triple oh yeah UID
+         )) {      
         lRet = ACR_90_00_FAILURE;
     }
+
 
     if ((lRet == SCARD_S_SUCCESS) && printResult) {
         // success: now print UID
@@ -108,16 +112,58 @@ LONG getUID(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL pri
     return lRet;
 }
 
-LONG getATR(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
+// supports 14443A and 14443B-3/4
+LONG getATS_14443A(SCARDHANDLE hCard, BYTE *pbRecvBuffer, DWORD *dwRecvLength) {
     BYTE pbSendBuffer[] = { 0xFF, 0xCA, 0x01, 0x00, 0x00 };
     LONG lRet = executeApdu(hCard, pbSendBuffer, sizeof(pbSendBuffer), pbRecvBuffer, dwRecvLength);
 
     if ((pbRecvBuffer[0] == 0x6A) && (pbRecvBuffer[1] == 0x81)) {
-        printf("Accessing ATR of this tag is not supported!\n");
+        printf("Accessing ATS of this tag is not supported!\n");
     }
 
     return lRet;
 }
+
+LONG getStatus(SCARDHANDLE *hCard, char *mszReaders, DWORD dwState, DWORD dwReaders, DWORD *dwActiveProtocol, BYTE *pbRecvBuffer, DWORD *dwRecvLength, BOOL printResult) {
+    LONG lRet = SCardStatus(*hCard, mszReaders, &dwReaders, &dwState, dwActiveProtocol, pbRecvBuffer, dwRecvLength);
+    if ((lRet == SCARD_S_SUCCESS) && printResult) {
+        // success: now print status
+        printf("Status of detected NFC tag: ");
+        for (DWORD i = 0; i < *dwRecvLength - 2; i++) { // -2 because no need to print success code 90 00
+            printf("%02X ", pbRecvBuffer[i]);
+        }
+        printf("\n");
+
+        if (sizeof(pbRecvBuffer) < 8) return 1;
+
+        // determine which kind of tag this is
+        BYTE tagIdentifyingByte1 = pbRecvBuffer[13];
+        BYTE tagIdentifyingByte2 = pbRecvBuffer[14];
+        if ((tagIdentifyingByte1 == 0x00) &&  (tagIdentifyingByte2 == 0x01)) {
+            printf("Identified tag as: Mifare Classic 1k\n");
+        } else if ((pbRecvBuffer[13] == 0x00) && (pbRecvBuffer[14] == 0x02)) {
+            printf("Identified tag as: Mifare Classic 4k\n");
+        } else if ((pbRecvBuffer[13] == 0x00) && (pbRecvBuffer[14] == 0x03)) {
+            printf("Identified tag as: Mifare Ultralight or NTAG2xx\n");
+        } else if ((pbRecvBuffer[13] == 0x00) && (pbRecvBuffer[14] == 0x26)) {
+            printf("Identified tag as: Mifare Mini\n");
+        } else if ((pbRecvBuffer[13] == 0xF0) && (pbRecvBuffer[14] == 0x04)) {
+            printf("Identified tag as: Topaz/Jewel\n");
+        } else if ((pbRecvBuffer[13] == 0xF0) && (pbRecvBuffer[14] == 0x11)) {
+            printf("Identified tag as: FeliCa 212K\n");
+        } else if ((pbRecvBuffer[13] == 0xF0) && (pbRecvBuffer[14] == 0x12)) {
+            printf("Identified tag as: FeliCa 424K\n");
+        } else if (pbRecvBuffer[13] == 0xFF) {
+            printf("Identified tag as: UNKNOWN TAG\n");
+        } else {
+            printf("Failed to identify the tag\n");
+        }
+    }
+
+
+    return lRet;
+}
+
 
 // -------------------- Helper functions -------------------------------------------------------
 BOOL containsSubstring(const char *string, const char *substring) {
@@ -170,6 +216,10 @@ int main(void) {
 
     BYTE pbRecvBuffer[256];
     DWORD dwRecvLength = sizeof(pbRecvBuffer);
+
+    BYTE pbRecvBufferLarge[2048];
+    DWORD dwRecvLengthLarge = sizeof(pbRecvBufferLarge);
+    DWORD dwState = SCARD_POWERED; // TODO: can u dynamically request the actual state somehow?
 
     // Establish context
     lRet = SCardEstablishContext(SCARD_SCOPE_SYSTEM, NULL, NULL, &hContext);
@@ -260,16 +310,23 @@ int main(void) {
     }
 
 
-    // Get ATR 14443-3
-    lRet = getATR(hCard, pbRecvBuffer, &dwRecvLength);
+    lRet = getATS_14443A(hCard, pbRecvBuffer, &dwRecvLength);
     if (lRet != SCARD_S_SUCCESS) {
         printf("Failed to get ATR of tag: 0x%x\n", (unsigned int)lRet);
         disconnectReader(hCard, hContext);
         return 1;
     }
 
-    // TODO: improve function getATR(), ideally so that you can identify exact name of tag for a large number of tags
-    
+    lRet = getStatus(&hCard, mszReaders, dwState, dwReaders, &dwActiveProtocol, pbRecvBufferLarge, &dwRecvLengthLarge, TRUE);
+    if (lRet != SCARD_S_SUCCESS) {
+        printf("Failed to get status of tag: 0x%x\n", (unsigned int)lRet);
+        disconnectReader(hCard, hContext);
+        return 1;
+    }
+
+    // TODO: why does the ATS thing never work?
+    // TODO: why can't it distinguish between Ultralight and NTAG?
+
     // -------------- End of: Interact with tag --------------------
 
     // Clean up
